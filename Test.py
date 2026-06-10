@@ -5,11 +5,7 @@ import json
 from supabase import create_client
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# [필수] .streamlit/secrets.toml 에 아래 두 줄만 넣으면 됩니다:
-#
-# [supabase]
-# url = "https://xxxxxxxxxxxx.supabase.co"
-# key = "eyJh..."   ← anon public key
+# [필수] .streamlit/secrets.toml 설정 확인
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ── Supabase 연결 (캐싱으로 재연결 방지) ─────────────────
@@ -32,7 +28,7 @@ CAND_COLS   = {"schedule": "후보 일정"}
 VOTE_COLS   = {"schedule": "일정", "voter": "투표자"}
 EVAL_COLS   = {"target_name": "대상자", "score": "점수", "comment": "코멘트"}
 
-# ── 공통 헬퍼 ────────────────────────────────────────────
+# ── 데이터 로드 및 변환 헬퍼 (새로고침 대응용 실시간 펑션) ──
 def to_display(df, col_map):
     return df.rename(columns=col_map)
 
@@ -40,12 +36,14 @@ def to_db(df, col_map):
     rev = {v: k for k, v in col_map.items()}
     return df.rename(columns=rev)
 
-def load_table(table, col_map):
-    """Supabase 테이블 → 한글 컬럼 DataFrame"""
+def fetch_table_directly(table, col_map):
+    """session_state에 의존하지 않고, 호출되는 순간 DB에서 직접 최신 데이터를 읽어옵니다."""
     try:
         res = sb.table(table).select("*").order("id").execute()
         if res.data:
-            df = pd.DataFrame(res.data).drop(columns=["id"], errors="ignore")
+            df = pd.DataFrame(res.data)
+            if "id" in df.columns:
+                df = df.drop(columns=["id"], errors="ignore")
             df = df.dropna(how="all")
             return to_display(df, col_map)
         return pd.DataFrame(columns=list(col_map.values()))
@@ -65,14 +63,14 @@ def save_table(table, display_df, col_map):
     except Exception as e:
         st.error(f"저장 오류: {e}")
 
-def save_minutes_to_db():
+def save_minutes_to_db(minutes_list):
     records = [
         {
             "meeting_date": m["시간"],
             "content": m["내용"],
             "comments": json.dumps(m["댓글"], ensure_ascii=False)
         }
-        for m in st.session_state.minutes
+        for m in minutes_list
     ]
     sb.table("minutes").delete().gte("id", 0).execute()
     if records:
@@ -84,81 +82,73 @@ def save_tasks_to_db(tasks_df):
     df["완료 근거"] = df["완료 근거"].fillna("")
     save_table("tasks", df, TASK_COLS)
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 초기 데이터 로드 (session_state)
+# 🔄 실시간 데이터 동기화 (새로고침 시 공백 현상 방지)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 1. 프로젝트 개요
-if "topic" not in st.session_state or "final_deadline" not in st.session_state:
-    meta_df = load_table("project_overview", {"topic": "주제", "final_deadline": "최종마감일"})
-    if not meta_df.empty:
-        st.session_state.topic = str(meta_df.iloc[0]["주제"]) if pd.notna(meta_df.iloc[0]["주제"]) else ""
-        dl = meta_df.iloc[0]["최종마감일"]
-        if pd.notna(dl) and str(dl).strip():
-            try:
-                st.session_state.final_deadline = datetime.datetime.strptime(str(dl).split()[0], "%Y-%m-%d").date()
-            except Exception:
-                st.session_state.final_deadline = None
-        else:
+# 1. 프로젝트 개요 로드
+meta_df = fetch_table_directly("project_overview", {"topic": "주제", "final_deadline": "최종마감일"})
+if not meta_df.empty:
+    st.session_state.topic = str(meta_df.iloc[0]["주제"]) if pd.notna(meta_df.iloc[0]["주제"]) else ""
+    dl = meta_df.iloc[0]["최종마감일"]
+    if pd.notna(dl) and str(dl).strip():
+        try:
+            st.session_state.final_deadline = datetime.datetime.strptime(str(dl).split()[0], "%Y-%m-%d").date()
+        except Exception:
             st.session_state.final_deadline = None
     else:
-        st.session_state.topic = ""
         st.session_state.final_deadline = None
+else:
+    st.session_state.topic = ""
+    st.session_state.final_deadline = None
 
-# 2. 팀원 목록
-if "team_members" not in st.session_state:
-    st.session_state.team_members = load_table("team_members", MEMBER_COLS)
+# 2. 팀원 목록 로드
+st.session_state.team_members = fetch_table_directly("team_members", MEMBER_COLS)
 
-# [수정 반영] 3. 작업 목록 - 초기 데이터 생성 시 강제 타입 변환으로 st.data_editor 호환성 확보
-if "tasks" not in st.session_state:
-    tasks_df = load_table("tasks", TASK_COLS)
-    if not tasks_df.empty:
-        if "마감일" in tasks_df.columns:
-            tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"], errors="coerce").dt.date
-    else:
-        tasks_df = pd.DataFrame(columns=list(TASK_COLS.values()))
-        tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"]).dt.date
-    st.session_state.tasks = tasks_df
+# 3. 작업 목록 로드 및 타입 변환 보완
+tasks_df = fetch_table_directly("tasks", TASK_COLS)
+if not tasks_df.empty:
+    if "마감일" in tasks_df.columns:
+        tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"], errors="coerce").dt.date
+else:
+    tasks_df = pd.DataFrame(columns=list(TASK_COLS.values()))
+    tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"]).dt.date
+st.session_state.tasks = tasks_df
 
-# 4. 공지사항
-if "notices" not in st.session_state:
-    notices_df = load_table("notices", NOTICE_COLS)
-    st.session_state.notices = notices_df.to_dict(orient="records") if not notices_df.empty else []
+# 4. 공지사항 로드
+notices_df = fetch_table_directly("notices", NOTICE_COLS)
+st.session_state.notices = notices_df.to_dict(orient="records") if not notices_df.empty else []
 
-# 5. 회의록
-if "minutes" not in st.session_state:
-    minutes_df = load_table("minutes", MINUTE_COLS)
-    minutes_list = []
-    for _, row in minutes_df.iterrows():
-        try:
-            comments = json.loads(row["댓글"]) if pd.notna(row.get("댓글")) and str(row["댓글"]).strip() else []
-        except Exception:
-            comments = []
-        minutes_list.append({
-            "시간": str(row.get("시간", "")),
-            "내용": str(row.get("내용", "")),
-            "댓글": comments
-        })
-    st.session_state.minutes = minutes_list
+# 5. 회의록 로드
+minutes_df = fetch_table_directly("minutes", MINUTE_COLS)
+minutes_list = []
+for _, row in minutes_df.iterrows():
+    try:
+        comments = json.loads(row["댓글"]) if pd.notna(row.get("댓글")) and str(row["댓글"]).strip() else []
+    except Exception:
+        comments = []
+    minutes_list.append({
+        "시간": str(row.get("시간", "")),
+        "내용": str(row.get("내용", "")),
+        "댓글": comments
+    })
+st.session_state.minutes = minutes_list
 
-# 6. 투표 후보
-if "candidates" not in st.session_state:
-    cand_df = load_table("vote_candidates", CAND_COLS)
-    st.session_state.candidates = cand_df["후보 일정"].dropna().tolist() if "후보 일정" in cand_df.columns else []
+# 6. 투표 후보 및 결과 로드
+cand_df = fetch_table_directly("vote_candidates", CAND_COLS)
+st.session_state.candidates = cand_df["후보 일정"].dropna().tolist() if "후보 일정" in cand_df.columns else []
 
-# 7. 투표 결과
-if "votes" not in st.session_state:
-    votes_df = load_table("vote_results", VOTE_COLS)
-    st.session_state.votes = votes_df.to_dict(orient="records") if not votes_df.empty else []
+votes_df = fetch_table_directly("vote_results", VOTE_COLS)
+st.session_state.votes = votes_df.to_dict(orient="records") if not votes_df.empty else []
 
-# 8. 기여도 평가
-if "evaluations" not in st.session_state:
-    eval_df = load_table("evaluations", EVAL_COLS)
-    st.session_state.evaluations = eval_df.to_dict(orient="records") if not eval_df.empty else []
+# 7. 기여도 평가 로드
+eval_df = fetch_table_directly("evaluations", EVAL_COLS)
+st.session_state.evaluations = eval_df.to_dict(orient="records") if not eval_df.empty else []
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 사이드바 메뉴
+# 📌 사이드바 메뉴
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 st.sidebar.title("📌 메뉴")
 page = st.sidebar.radio(
@@ -309,9 +299,9 @@ elif page == "팀원 및 역할 관리":
     )
 
     if st.button("💾 팀원 목록 저장"):
-        st.session_state.team_members = edited_members
         save_table("team_members", edited_members, MEMBER_COLS)
         st.success("팀원 목록이 Supabase에 저장되었습니다!")
+        st.rerun()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -327,8 +317,6 @@ elif page == "프로젝트 및 작업 관리":
 
         if st.button("주제 확정하기"):
             if new_topic:
-                st.session_state.topic = new_topic
-                st.session_state.final_deadline = final_date
                 sb.table("project_overview").delete().gte("id", 0).execute()
                 sb.table("project_overview").insert(
                     {"topic": new_topic, "final_deadline": str(final_date)}
@@ -338,7 +326,7 @@ elif page == "프로젝트 및 작업 관리":
             else:
                 st.warning("주제를 입력해주세요!")
     else:
-        st.info(f"⏰ 최종 마감일: {st.session_state.final_deadline}")
+        st.info(f"🎯 현재 주제: {st.session_state.topic} | ⏰ 최종 마감일: {st.session_state.final_deadline}")
 
         st.markdown("### 2️⃣ 세부 작업 배정")
         with st.form("add_task_form", clear_on_submit=True):
@@ -363,7 +351,6 @@ elif page == "프로젝트 및 작업 관리":
                         "예상 소요시간(시간)": [task_hours], "마감일": [task_deadline], "완료 근거": [""]
                     })
                     updated = pd.concat([st.session_state.tasks, new_task], ignore_index=True)
-                    st.session_state.tasks = updated
                     save_tasks_to_db(updated)
                     st.success(f"'{task_name}' 작업이 저장되었습니다!")
                     st.rerun()
@@ -394,9 +381,9 @@ elif page == "프로젝트 및 작업 관리":
                 st.error("🚨 '완료' 상태인 작업에 완료 근거를 입력해주세요.")
                 st.info(f"누락 작업: {', '.join(invalid['작업명'].tolist())}")
             else:
-                st.session_state.tasks = edited_tasks
                 save_tasks_to_db(edited_tasks)
                 st.success("작업 목록이 Supabase에 저장되었습니다!")
+                st.rerun()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -438,7 +425,7 @@ elif page == "공지·회의록 및 투표":
                     st.session_state.minutes.append({
                         "시간": m_date.strftime("%Y-%m-%d"), "내용": content, "댓글": []
                     })
-                    save_minutes_to_db()
+                    save_minutes_to_db(st.session_state.minutes)
                     st.success("회의록이 Supabase에 저장되었습니다.")
                     st.rerun()
                 else:
@@ -446,7 +433,6 @@ elif page == "공지·회의록 및 투표":
 
         st.markdown("---")
         for i, minute in enumerate(reversed(st.session_state.minutes)):
-            # [수정 반영] 인덱스 뒤바뀜 에러를 방지하기 위해 key에 고유 시간 정보 조합
             minute_key = f"{minute['시간']}_{i}"
             with st.expander(f"🗓️ {minute['시간']}"):
                 st.markdown(minute["내용"])
@@ -458,7 +444,7 @@ elif page == "공지·회의록 및 투표":
                     if comment_input:
                         actual_index = len(st.session_state.minutes) - 1 - i
                         st.session_state.minutes[actual_index]["댓글"].append(comment_input)
-                        save_minutes_to_db()
+                        save_minutes_to_db(st.session_state.minutes)
                         st.rerun()
 
     with tab3:
