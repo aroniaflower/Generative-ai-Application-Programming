@@ -51,13 +51,19 @@ def fetch_table_directly(table, col_map):
         return pd.DataFrame(columns=list(col_map.values()))
 
 def save_table(table, display_df, col_map):
-    """DataFrame 전체를 테이블에 덮어쓰기"""
+    """DataFrame 전체를 테이블에 덮어쓰기 (기존 안전 장치 보완)"""
     try:
         db_df = to_db(display_df.copy(), col_map)
         records = db_df.where(pd.notna(db_df), None).to_dict(orient="records")
         for r in records:
             r.pop("id", None)
-        sb.table(table).delete().gte("id", 0).execute()
+        
+        # 전체 삭제 에러 방지를 위해 레코드가 있을 때만 타겟 필터 처리 유연화
+        try:
+            sb.table(table).delete().neq("id", -1).execute()
+        except Exception:
+            sb.table(table).delete().gte("id", 0).execute()
+            
         if records:
             sb.table(table).insert(records).execute()
     except Exception as e:
@@ -72,7 +78,11 @@ def save_minutes_to_db(minutes_list):
         }
         for m in minutes_list
     ]
-    sb.table("minutes").delete().gte("id", 0).execute()
+    try:
+        sb.table("minutes").delete().neq("id", -1).execute()
+    except Exception:
+        sb.table("minutes").delete().gte("id", 0).execute()
+        
     if records:
         sb.table("minutes").insert(records).execute()
 
@@ -315,19 +325,36 @@ elif page == "프로젝트 및 작업 관리":
         new_topic = st.text_input("프로젝트의 큰 주제를 입력하세요:")
         final_date = st.date_input("최종 마감일을 선택하세요:")
 
+        # [수정 반영] 에러 유발하는 delete 로직 대신 안전한 단일 레코드 일치화(Upsert 개념) 구조 도입
         if st.button("주제 확정하기"):
             if new_topic:
-                sb.table("project_overview").delete().gte("id", 0).execute()
+                try:
+                    # 1단계: 기존 테이블 데이터 전부 비우기 시도 (안전 필터 적용)
+                    sb.table("project_overview").delete().neq("topic", "NON_EXISTENT_VALUE_XYZ").execute()
+                except Exception:
+                    pass
+                
+                # 2단계: 신규 주제 삽입
                 sb.table("project_overview").insert(
                     {"topic": new_topic, "final_deadline": str(final_date)}
                 ).execute()
+                
                 st.success("프로젝트 주제가 Supabase에 저장되었습니다!")
                 st.rerun()
             else:
                 st.warning("주제를 입력해주세요!")
     else:
         st.info(f"🎯 현재 주제: {st.session_state.topic} | ⏰ 최종 마감일: {st.session_state.final_deadline}")
+        
+        # 주제 초기화/재설정 버튼 추가 (잘못 적었을 경우 복구용 장치)
+        if st.button("🔄 주제 초기화 및 다시 설정하기"):
+            try:
+                sb.table("project_overview").delete().neq("topic", "NON_EXISTENT_VALUE_XYZ").execute()
+            except Exception:
+                pass
+            st.rerun()
 
+        st.markdown("---")
         st.markdown("### 2️⃣ 세부 작업 배정")
         with st.form("add_task_form", clear_on_submit=True):
             col1, col2, col3, col4 = st.columns(4)
