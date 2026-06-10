@@ -109,11 +109,15 @@ if "topic" not in st.session_state or "final_deadline" not in st.session_state:
 if "team_members" not in st.session_state:
     st.session_state.team_members = load_table("team_members", MEMBER_COLS)
 
-# 3. 작업 목록
+# [수정 반영] 3. 작업 목록 - 초기 데이터 생성 시 강제 타입 변환으로 st.data_editor 호환성 확보
 if "tasks" not in st.session_state:
     tasks_df = load_table("tasks", TASK_COLS)
-    if "마감일" in tasks_df.columns:
-        tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"], errors="coerce").dt.date
+    if not tasks_df.empty:
+        if "마감일" in tasks_df.columns:
+            tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"], errors="coerce").dt.date
+    else:
+        tasks_df = pd.DataFrame(columns=list(TASK_COLS.values()))
+        tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"]).dt.date
     st.session_state.tasks = tasks_df
 
 # 4. 공지사항
@@ -191,7 +195,7 @@ if page == "통합 대시보드":
             if not st.session_state.tasks.empty and "상태" in st.session_state.tasks.columns:
                 total_tasks = len(st.session_state.tasks)
                 completed_tasks = len(st.session_state.tasks[st.session_state.tasks["상태"] == "완료"])
-                completion_rate = (completed_tasks / total_tasks) * 100
+                completion_rate = (completed_tasks / total_tasks) * 100 if total_tasks > 0 else 0
             else:
                 completion_rate = 0
             st.metric(label="팀 전체 작업 완료율", value=f"{completion_rate:.1f}%")
@@ -356,7 +360,7 @@ elif page == "프로젝트 및 작업 관리":
                 if task_name and assignee:
                     new_task = pd.DataFrame({
                         "작업명": [task_name], "담당자": [assignee], "상태": ["미시작"],
-                        "예상 소요시간(시간)": [task_hours], "마감일": [str(task_deadline)], "완료 근거": [""]
+                        "예상 소요시간(시간)": [task_hours], "마감일": [task_deadline], "완료 근거": [""]
                     })
                     updated = pd.concat([st.session_state.tasks, new_task], ignore_index=True)
                     st.session_state.tasks = updated
@@ -442,13 +446,15 @@ elif page == "공지·회의록 및 투표":
 
         st.markdown("---")
         for i, minute in enumerate(reversed(st.session_state.minutes)):
+            # [수정 반영] 인덱스 뒤바뀜 에러를 방지하기 위해 key에 고유 시간 정보 조합
+            minute_key = f"{minute['시간']}_{i}"
             with st.expander(f"🗓️ {minute['시간']}"):
                 st.markdown(minute["내용"])
                 st.markdown("#### 💬 댓글")
                 for comment in minute["댓글"]:
                     st.write(f"- {comment}")
-                comment_input = st.text_input("댓글 입력", key=f"comment_{i}")
-                if st.button("댓글 달기", key=f"btn_{i}"):
+                comment_input = st.text_input("댓글 입력", key=f"comment_{minute_key}")
+                if st.button("댓글 달기", key=f"btn_{minute_key}"):
                     if comment_input:
                         actual_index = len(st.session_state.minutes) - 1 - i
                         st.session_state.minutes[actual_index]["댓글"].append(comment_input)
