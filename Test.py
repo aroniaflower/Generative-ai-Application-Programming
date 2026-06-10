@@ -4,7 +4,7 @@ import json
 import sys
 import subprocess
 
-# ── [필수] Supabase 패키지 미설치 에러(ModuleNotFoundError) 자동 방지 대책 ──
+# ── [필수] Supabase 패키지 미설치 에러 자동 방지 대책 ──
 try:
     from supabase import create_client
 except ModuleNotFoundError:
@@ -24,27 +24,29 @@ def get_supabase():
 sb = get_supabase()
 
 # ── DB 영문 컬럼 ↔ 화면 한글 컬럼 매핑 ──────────────────
-MEMBER_COLS = {"name": "이름", "role": "역할", "weekly_hours": "주간 가용시간(시간)"}
-TASK_COLS   = {"task_name": "작업명", "assignee": "담당자", "status": "상태",
+MEMBER_COLS = {"id": "id", "name": "이름", "role": "역할", "weekly_hours": "주간 가용시간(시간)"}
+TASK_COLS   = {"id": "id", "task_name": "작업명", "assignee": "담당자", "status": "상태",
                "estimated_hours": "예상 소요시간(시간)", "deadline": "마감일", "completion_note": "완료 근거"}
-NOTICE_COLS = {"posted_at": "시간", "content": "내용"}
-MINUTE_COLS = {"meeting_date": "시간", "content": "내용", "comments": "댓글"}
-CAND_COLS   = {"schedule": "후보 일정"}
-VOTE_COLS   = {"schedule": "일정", "voter": "투표자"}
-EVAL_COLS   = {"target_name": "대상자", "score": "점수", "comment": "코멘트"}
+NOTICE_COLS = {"id": "id", "posted_at": "시간", "content": "내용"}
+MINUTE_COLS = {"id": "id", "meeting_date": "시간", "content": "내용", "comments": "댓글"}
+CAND_COLS   = {"id": "id", "schedule": "후보 일정"}
+VOTE_COLS   = {"id": "id", "schedule": "일정", "voter": "투표자"}
+EVAL_COLS   = {"id": "id", "target_name": "대상자", "score": "점수", "comment": "코멘트"}
 
 # ── 데이터 로드 및 변환 헬퍼 ─────────────────────────────
 def to_display(df, col_map):
-    return df.rename(columns=col_map)
+    # 매핑에 존재하는 컬럼만 변경하고 id는 유지
+    actual_map = {k: v for k, v in col_map.items() if k in df.columns}
+    return df.rename(columns=actual_map)
 
 def to_db(df, col_map):
     rev = {v: k for k, v in col_map.items()}
-    return df.rename(columns=rev)
+    actual_map = {k: v for k, v in rev.items() if k in df.columns}
+    return df.rename(columns=actual_map)
 
 def fetch_table_directly(table, col_map):
-    """DB에서 직접 최신 데이터를 실시간으로 읽어옵니다."""
     try:
-        res = sb.table(table).select("*").execute()
+        res = sb.table(table).select("*").order("id", ascending=True).execute()
         if res.data:
             df = pd.DataFrame(res.data)
             df = df.dropna(how="all")
@@ -53,30 +55,27 @@ def fetch_table_directly(table, col_map):
     except Exception:
         return pd.DataFrame(columns=list(col_map.values()))
 
-def save_table_via_upsert(table, display_df, col_map):
-    """위험한 전체 삭제(delete) 대신, 고유 식별값 id를 기준으로 Upsert를 처리하여 APIError를 방지합니다."""
+def save_table_with_sync(table, display_df, col_map):
+    """
+    웹앱 UI에서 행을 삭제(제거)했을 때 DB에서도 똑같이 제거되도록
+    기존 전체 데이터를 밀고(기본값 우회 처리) 새로 동기화하는 안전한 로직입니다.
+    """
     try:
         db_df = to_db(display_df.copy(), col_map)
         records = db_df.where(pd.notna(db_df), None).to_dict(orient="records")
         
-        # 만약 id가 없는 새 레코드라면 순차 부여 처리
+        # 1. 고유 ID 재정렬 및 정리
         for i, r in enumerate(records):
-            if "id" not in r or r["id"] is None:
-                r["id"] = i + 1
+            r["id"] = i + 1
+            
+        # 2. 기존 DB 내역 비우기 (RLS가 꺼져있어야 작동합니다)
+        sb.table(table).delete().neq("id", -1).execute()
         
+        # 3. 깨끗해진 DB에 현재 웹앱 화면의 데이터만 새로 삽입
         if records:
-            # 안전한 상위 업서트 공정 적용
-            sb.table(table).upsert(records).execute()
+            sb.table(table).insert(records).execute()
     except Exception as e:
-        # 업서트 예외 대응용 대체 로직
-        try:
-            db_df = to_db(display_df.copy(), col_map)
-            records = db_df.where(pd.notna(db_df), None).to_dict(orient="records")
-            for r in records: r.pop("id", None)
-            sb.table(table).delete().neq("name", "NON_EXIST_VAL_XYZ").execute()
-            if records: sb.table(table).insert(records).execute()
-        except Exception as ex:
-            st.error(f"데이터 연동 오류 보완 적용 중: {ex}")
+        st.error(f"데이터 동기화 실패 (Supabase RLS 설정을 꼭 확인하세요): {e}")
 
 def save_minutes_to_db(minutes_list):
     records = []
@@ -88,28 +87,21 @@ def save_minutes_to_db(minutes_list):
             "comments": json.dumps(m["댓글"], ensure_ascii=False)
         })
     try:
+        sb.table("minutes").delete().neq("id", -1).execute()
         if records:
-            sb.table("minutes").upsert(records).execute()
-    except Exception:
-        try:
-            sb.table("minutes").delete().neq("content", "NON_EXIST_VAL_XYZ").execute()
-            if records:
-                for r in records: r.pop("id", None)
-                sb.table("minutes").insert(records).execute()
-        except Exception as e:
-            st.error(f"회의록 저장 실패: {e}")
+            sb.table("minutes").insert(records).execute()
+    except Exception as e:
+        st.error(f"회의록 저장 실패: {e}")
 
 def save_tasks_to_db(tasks_df):
     df = tasks_df.copy()
-    if "id" not in df.columns:
-        df["id"] = range(1, len(df) + 1)
     df["마감일"] = df["마감일"].apply(lambda x: str(x) if pd.notna(x) and x is not None else None)
     df["완료 근거"] = df["완료 근거"].fillna("")
-    save_table_via_upsert("tasks", df, TASK_COLS)
+    save_table_with_sync("tasks", df, TASK_COLS)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🔄 실시간 데이터 동기화 및 데이터 타입 불일치(StreamlitAPIException) 해결
+# 🔄 실시간 데이터 동기화
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # 1. 프로젝트 개요 로드
@@ -128,12 +120,12 @@ else:
     st.session_state.topic = ""
     st.session_state.final_deadline = None
 
-# 2. 팀원 목록 로드
+# 2. 팀원 목록 로드 (편집을 위해 id 유지)
 st.session_state.team_members = fetch_table_directly("team_members", MEMBER_COLS)
 if "id" in st.session_state.team_members.columns:
     st.session_state.team_members = st.session_state.team_members.drop(columns=["id"])
 
-# 3. 작업 목록 로드 및 타입 일치화 (st.data_editor 튕김 방지 핵심 구간)
+# 3. 작업 목록 로드 및 타입 일치화 (편집을 위해 id 유지)
 tasks_df = fetch_table_directly("tasks", TASK_COLS)
 if not tasks_df.empty:
     if "마감일" in tasks_df.columns:
@@ -141,12 +133,13 @@ if not tasks_df.empty:
     if "id" in tasks_df.columns:
         tasks_df = tasks_df.drop(columns=["id"])
 else:
-    tasks_df = pd.DataFrame(columns=list(TASK_COLS.values()))
+    tasks_df = pd.DataFrame(columns=[v for k, v in TASK_COLS.items() if k != "id"])
     tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"]).dt.date
 st.session_state.tasks = tasks_df
 
 # 4. 공지사항 로드
 notices_df = fetch_table_directly("notices", NOTICE_COLS)
+if not notices_df.empty and "id" in notices_df.columns: notices_df = notices_df.drop(columns=["id"])
 st.session_state.notices = notices_df.to_dict(orient="records") if not notices_df.empty else []
 
 # 5. 회의록 로드
@@ -314,7 +307,7 @@ elif page == "팀원 및 역할 관리":
 
     st.markdown("---")
     st.markdown("### ✍️ 팀원 명단 및 가용 시간 설정")
-    st.caption("팀원의 이름, 역할 및 주간 가용 시간을 입력해 주세요.")
+    st.caption("💡 **행 삭제 방법:** 지우고 싶은 행 왼쪽 끝 빈 공간을 체크한 후, 키보드의 `Delete` 키를 누르거나 우측 하단의 휴지통 아이콘을 누르고 '팀원 목록 저장'을 누르세요.")
 
     edited_members = st.data_editor(
         st.session_state.team_members,
@@ -328,8 +321,8 @@ elif page == "팀원 및 역할 관리":
     )
 
     if st.button("💾 팀원 목록 저장"):
-        save_table_via_upsert("team_members", edited_members, MEMBER_COLS)
-        st.success("팀원 목록이 Supabase에 안전하게 반영되었습니다!")
+        save_table_with_sync("team_members", edited_members, MEMBER_COLS)
+        st.success("팀원 목록 삭제 및 수정사항이 반영되었습니다!")
         st.rerun()
 
 
@@ -347,7 +340,6 @@ elif page == "프로젝트 및 작업 관리":
         if st.button("주제 확정하기"):
             if new_topic:
                 try:
-                    # 충돌을 유발하는 delete 구문 전면 제거 후 고정된 단일 인덱스(id=1) 업서트 연동
                     sb.table("project_overview").upsert(
                         {"id": 1, "topic": new_topic, "final_deadline": str(final_date)}
                     ).execute()
@@ -398,9 +390,8 @@ elif page == "프로젝트 및 작업 관리":
                     st.warning("작업명과 담당자를 입력해주세요.")
 
         st.markdown("#### 📋 세부 작업 목록 및 상태 업데이트")
-        st.caption("💡 '완료' 상태로 변경할 때는 반드시 '완료 근거'를 작성해야 저장됩니다.")
+        st.caption("💡 **일정 삭제 방법:** 삭제할 행 왼쪽 끝을 체크하고 키보드 `Delete` 키를 누르거나 표 하단 휴지통 아이콘을 누른 후 '작업 목록 저장'을 누르세요.")
 
-        # 데이터 에디터 렌더링
         edited_tasks = st.data_editor(
             st.session_state.tasks,
             num_rows="dynamic",
@@ -423,7 +414,7 @@ elif page == "프로젝트 및 작업 관리":
                 st.info(f"누락 작업: {', '.join(invalid['작업명'].tolist())}")
             else:
                 save_tasks_to_db(edited_tasks)
-                st.success("작업 목록이 Supabase에 저장되었습니다!")
+                st.success("작업 목록 및 일정 삭제 내역이 반영되었습니다!")
                 st.rerun()
 
 
@@ -440,7 +431,7 @@ elif page == "공지·회의록 및 투표":
             if new_notice:
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
                 st.session_state.notices.append({"시간": now, "내용": new_notice})
-                save_table_via_upsert("notices", pd.DataFrame(st.session_state.notices), NOTICE_COLS)
+                save_table_with_sync("notices", pd.DataFrame(st.session_state.notices), NOTICE_COLS)
                 st.success("공지가 등록되었습니다.")
                 st.rerun()
 
@@ -498,7 +489,7 @@ elif page == "공지·회의록 및 투표":
             if st.button("후보 추가") and new_candidate:
                 if new_candidate not in st.session_state.candidates:
                     st.session_state.candidates.append(new_candidate)
-                    save_table_via_upsert("vote_candidates",
+                    save_table_with_sync("vote_candidates",
                                            pd.DataFrame({"후보 일정": st.session_state.candidates}),
                                            CAND_COLS)
                     st.rerun()
@@ -511,7 +502,7 @@ elif page == "공지·회의록 및 투표":
                     st.session_state.votes = [v for v in st.session_state.votes if v["투표자"] != voter]
                     for opt in selected:
                         st.session_state.votes.append({"일정": opt, "투표자": voter})
-                    save_table_via_upsert("vote_results",
+                    save_table_with_sync("vote_results",
                                            pd.DataFrame(st.session_state.votes) if st.session_state.votes else pd.DataFrame(columns=["일정", "투표자"]),
                                            VOTE_COLS)
                     st.success("투표 완료!")
@@ -546,7 +537,7 @@ elif page == "기여도 평가":
             st.session_state.evaluations.append({
                 "대상자": eval_target, "점수": score, "코멘트": eval_comment
             })
-            save_table_via_upsert("evaluations",
+            save_table_with_sync("evaluations",
                                    pd.DataFrame(st.session_state.evaluations),
                                    EVAL_COLS)
             st.success(f"{eval_target}님 평가가 익명으로 저장되었습니다!")
