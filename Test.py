@@ -1,29 +1,66 @@
 import streamlit as st
 import pandas as pd
 import datetime
+from streamlit_gsheets import GSheetsConnection  # 구글 시트 연동 라이브러리
 
-# --- 초기 데이터 세팅 (Session State) ---
-if 'topic' not in st.session_state:
-    st.session_state.topic = ""
-if 'final_deadline' not in st.session_state:
-    st.session_state.final_deadline = None
+# --- [중요] 구글 시트 커넥션 연결 ---
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# [FR-006 대응] 주간 가용시간 컬럼 추가
+# --- 초기 데이터 세팅 및 구글 시트 데이터 불러오기 (Read) ---
+
+# 1. 프로젝트 주제 및 마감일 로드 (ProjectMeta 탭)
+if 'topic' not in st.session_state or 'final_deadline' not in st.session_state:
+    try:
+        meta_df = conn.read(worksheet="ProjectMeta", ttl=0)
+        meta_df = meta_df.dropna(how='all')
+        if not meta_df.empty:
+            st.session_state.topic = meta_df.iloc[0]["topic"]
+            deadline_str = meta_df.iloc[0]["final_deadline"]
+            if pd.notna(deadline_str) and deadline_str != "":
+                st.session_state.final_deadline = datetime.datetime.strptime(str(deadline_str), "%Y-%m-%d").date()
+            else:
+                st.session_state.final_deadline = None
+        else:
+            st.session_state.topic = ""
+            st.session_state.final_deadline = None
+    except:
+        st.session_state.topic = ""
+        st.session_state.final_deadline = None
+
+# 2. 팀원 명단 로드 (TeamMembers 탭)
 if 'team_members' not in st.session_state:
-    st.session_state.team_members = pd.DataFrame(columns=["이름", "역할", "주간 가용시간(시간)"])
+    try:
+        members_df = conn.read(worksheet="TeamMembers", ttl=0)
+        members_df = members_df.dropna(how='all')
+        if members_df.empty:
+            st.session_state.team_members = pd.DataFrame(columns=["이름", "역할", "주간 가용시간(시간)"])
+        else:
+            st.session_state.team_members = members_df
+    except:
+        st.session_state.team_members = pd.DataFrame(columns=["이름", "역할", "주간 가용시간(시간)"])
 
-# [FR-007, FR-005 대응] 진행률(%) 대신 '상태'와 '예상 소요시간' 컬럼으로 변경
+# 3. 세부 작업 목록 로드 (Tasks 탭)
 if 'tasks' not in st.session_state:
-    st.session_state.tasks = pd.DataFrame(columns=["작업명", "담당자", "상태", "예상 소요시간(시간)", "마감일", "완료 근거"])
+    try:
+        tasks_df = conn.read(worksheet="Tasks", ttl=0)
+        tasks_df = tasks_df.dropna(how='all')
+        if tasks_df.empty:
+            st.session_state.tasks = pd.DataFrame(columns=["작업명", "담당자", "상태", "예상 소요시간(시간)", "마감일", "완료 근거"])
+        else:
+            # 구글 시트의 날짜 문자열을 파이썬 date 객체로 변환 (st.data_editor 호환용)
+            if "마감일" in tasks_df.columns:
+                tasks_df["마감일"] = pd.to_datetime(tasks_df["마감일"], errors='coerce').dt.date
+            st.session_state.tasks = tasks_df
+    except:
+        st.session_state.tasks = pd.DataFrame(columns=["작업명", "담당자", "상태", "예상 소요시간(시간)", "마감일", "완료 근거"])
 
+# 나머지 세션 상태는 기존 상태 유지 (필요 시 확장 가능)
 if 'notices' not in st.session_state:
     st.session_state.notices = []
 if 'minutes' not in st.session_state:
     st.session_state.minutes = []
 if 'evaluations' not in st.session_state:
     st.session_state.evaluations = []
-
-# [FR-003 대응] 일정 투표를 위한 데이터 세팅
 if 'candidates' not in st.session_state:
     st.session_state.candidates = []
 if 'votes' not in st.session_state:
@@ -43,12 +80,16 @@ if page == "통합 대시보드":
     if st.session_state.topic:
         st.subheader(f"🎯 현재 프로젝트 주제: {st.session_state.topic}")
         
-        # 최상단: D-Day 및 완료율 (NFR-001 대응)
         col1, col2 = st.columns(2)
         with col1:
             if st.session_state.final_deadline:
                 today = datetime.date.today()
-                d_day = (st.session_state.final_deadline - today).days
+                # 마감일 타입 예외 처리
+                f_deadline = st.session_state.final_deadline
+                if isinstance(f_deadline, str):
+                    f_deadline = datetime.datetime.strptime(f_deadline, "%Y-%m-%d").date()
+                
+                d_day = (f_deadline - today).days
                 if d_day > 0:
                     st.info(f"⏳ 최종 마감일까지 **D-{d_day}** 남았습니다!")
                 elif d_day == 0:
@@ -67,13 +108,9 @@ if page == "통합 대시보드":
 
         st.markdown("---")
         
-        # [고도화] FR-005, FR-006: 가용 시간 대비 주간 과부하 경고 로직
         st.markdown("### 🚨 팀원 업무 부하 상태")
         if not st.session_state.tasks.empty and not st.session_state.team_members.empty:
-            incomplete_tasks = st.session_state.tasks[st.session_state.tasks["상태"] != "완료"]
-            
-            # 담당자별 미완료 작업의 예상 소요시간 합산
-            # 숫자로 변환하여 계산 유연성 확보
+            incomplete_tasks = st.session_state.tasks[st.session_state.tasks["상태"] != "완료"].copy()
             incomplete_tasks["예상 소요시간(시간)"] = pd.to_numeric(incomplete_tasks["예상 소요시간(시간)"], errors='coerce').fillna(0)
             member_hours = incomplete_tasks.groupby("담당자")["예상 소요시간(시간)"].sum().to_dict()
             
@@ -101,17 +138,15 @@ if page == "통합 대시보드":
 
         st.markdown("---")
         
-        # [신규] FR-010: 마감일 임박 미완료 작업 (위험 상태 표시)
         st.markdown("### ⏰ 마감 임박 미완료 작업")
         if not st.session_state.tasks.empty:
             today = datetime.date.today()
             danger_tasks = []
             for _, row in st.session_state.tasks.iterrows():
-                if row["상태"] != "완료":
+                if row["상태"] != "완료" and pd.notna(row["마감일"]):
                     t_date = row["마감일"]
                     if isinstance(t_date, str):
                         t_date = datetime.datetime.strptime(t_date, "%Y-%m-%d").date()
-                    # 마감일이 오늘 포함 2일 이내인 경우
                     if (t_date - today).days <= 2:
                         danger_tasks.append(row)
             
@@ -124,13 +159,12 @@ if page == "통합 대시보드":
 
         st.markdown("---")
         
-        # 최근 공지 및 회의록 요약 (FR-014 대응)
         col_notice, col_minute = st.columns(2)
         with col_notice:
             st.markdown("#### 📢 최근 공지")
             if st.session_state.notices:
                 latest_notice = st.session_state.notices[-1]
-                st.info(f"**[{latest_notice['시간']}]**\n\n{latest_notice['내용']}")
+                st.info(f"**[{latest_notice['시간']}]**\n\n{latest_notice['내념']}")
             else:
                 st.write("등록된 공지가 없습니다.")
                 
@@ -154,7 +188,6 @@ if page == "통합 대시보드":
 elif page == "팀원 및 역할 관리":
     st.title("👥 팀원 및 역할 관리")
     
-    # [신규] FR-002: 팀원 초대 기능 시뮬레이션
     st.markdown("### 📨 팀원 초대 링크 생성")
     if st.button("🔗 초대 링크 발급하기"):
         project_slug = st.session_state.topic if st.session_state.topic else "new-project"
@@ -174,9 +207,13 @@ elif page == "팀원 및 역할 관리":
         }
     )
     
+    # [구글 시트 연동 데이터 저장]
     if st.button("💾 팀원 목록 저장"):
         st.session_state.team_members = edited_members
-        st.success("팀원 목록과 가용 시간이 안전하게 저장되었습니다!")
+        
+        # 구글 시트 업데이트 수행
+        conn.update(worksheet="TeamMembers", data=edited_members)
+        st.success("팀원 목록과 가용 시간이 구글 시트에 실시간으로 저장되었습니다!")
 
 # --- 3. 프로젝트 및 작업 관리 ---
 elif page == "프로젝트 및 작업 관리":
@@ -187,10 +224,16 @@ elif page == "프로젝트 및 작업 관리":
         new_topic = st.text_input("프로젝트의 큰 주제를 입력하세요:")
         final_date = st.date_input("최종 마감일을 선택하세요:")
         
+        # [구글 시트 연동 데이터 저장]
         if st.button("주제 확정하기"):
             if new_topic:
                 st.session_state.topic = new_topic
                 st.session_state.final_deadline = final_date
+                
+                # 구글 시트에 구조화하여 업데이트
+                meta_df = pd.DataFrame([{"topic": new_topic, "final_deadline": str(final_date)}])
+                conn.update(worksheet="ProjectMeta", data=meta_df)
+                st.success("프로젝트 주제가 확정되어 구글 시트에 동기화되었습니다!")
                 st.rerun()
             else:
                 st.warning("주제를 입력해주세요!")
@@ -210,25 +253,32 @@ elif page == "프로젝트 및 작업 관리":
                 else:
                     assignee = st.text_input("담당자 (팀원 우선 등록 필요)")
             with col3:
-                # [FR-005 반영] 예상 소요시간 입력란 추가
                 task_hours = st.number_input("예상 소요시간(시간)", min_value=1, max_value=50, value=3)
             with col4:
                 task_deadline = st.date_input("작업 마감일")
                 
             submit_button = st.form_submit_button("➕ 작업 배정하기")
             
+            # [구글 시트 연동 데이터 추가]
             if submit_button:
                 if task_name and assignee:
                     new_task = pd.DataFrame({
                         "작업명": [task_name],
                         "담당자": [assignee],
-                        "상태": ["미시작"],  # [FR-007] 기본 상태는 미시작
+                        "상태": ["미시작"],
                         "예상 소요시간(시간)": [task_hours],
-                        "마감일": [task_deadline],
+                        "마감일": [str(task_deadline)],
                         "완료 근거": [""]
                     })
-                    st.session_state.tasks = pd.concat([st.session_state.tasks, new_task], ignore_index=True)
-                    st.success(f"'{task_name}' 작업이 배정되었습니다!")
+                    updated_tasks = pd.concat([st.session_state.tasks, new_task], ignore_index=True)
+                    st.session_state.tasks = updated_tasks
+                    
+                    # 구글 시트 저장용 포맷 변경 (날짜 객체를 문자로 통일)
+                    save_tasks = updated_tasks.copy()
+                    save_tasks["마감일"] = save_tasks["마감일"].astype(str)
+                    conn.update(worksheet="Tasks", data=save_tasks)
+                    
+                    st.success(f"'{task_name}' 작업이 배정되어 구글 시트에 기록되었습니다!")
                     st.rerun()
                 else:
                     st.warning("작업명과 담당자를 모두 입력해주세요.")
@@ -236,7 +286,6 @@ elif page == "프로젝트 및 작업 관리":
         st.markdown("#### 📋 세부 작업 목록 및 상태 업데이트")
         st.caption("💡 작업을 '완료'로 변경할 때는 반드시 '완료 근거'(구글드링크, 메모 등)를 작성해야 저장됩니다.")
         
-        # [FR-007] 드롭다운 형태로 미시작/진행 중/완료 변경 가능하도록 설정
         edited_tasks = st.data_editor(
             st.session_state.tasks,
             num_rows="dynamic",
@@ -253,8 +302,8 @@ elif page == "프로젝트 및 작업 관리":
             use_container_width=True
         )
         
+        # [구글 시트 연동 데이터 저장 및 검증]
         if st.button("💾 작업 목록 저장"):
-            # [FR-008 검증 로직] 상태가 완료인데 완료 근거가 비어있는지 확인
             invalid_completed_tasks = edited_tasks[
                 (edited_tasks["상태"] == "완료") & 
                 ((edited_tasks["완료 근거"].isna()) | (edited_tasks["완료 근거"].str.strip() == ""))
@@ -265,7 +314,13 @@ elif page == "프로젝트 및 작업 관리":
                 st.info(f"근거가 누락된 작업: {', '.join(invalid_completed_tasks['작업명'].tolist())}")
             else:
                 st.session_state.tasks = edited_tasks
-                st.success("작업 목록과 상태가 성공적으로 업데이트되었습니다!")
+                
+                # 구글 시트 반영 전 날짜 컬럼을 깔끔하게 문자열 변환
+                save_tasks = edited_tasks.copy()
+                save_tasks["마감일"] = save_tasks["마감일"].astype(str)
+                conn.update(worksheet="Tasks", data=save_tasks)
+                
+                st.success("작업 목록과 상태가 구글 시트에 성공적으로 동기화되었습니다!")
 
 # --- 4. 공지·회의록 및 투표 ---
 elif page == "공지·회의록 및 투표":
@@ -285,7 +340,6 @@ elif page == "공지·회의록 및 투표":
             st.info(f"**[{notice['시간']}]**\n\n{notice['내용']}")
             
     with tab2:
-        # [FR-012 고도화] 구조화된 회의록 입력 폼
         st.markdown("### ✍️ 구조화된 회의록 작성")
         with st.form("structured_meeting_form", clear_on_submit=True):
             m_date = st.date_input("회의 일시", value=datetime.date.today())
@@ -324,14 +378,13 @@ elif page == "공지·회의록 및 투표":
                         st.rerun()
 
     with tab3:
-        # [신규] FR-003: 회의 일정 투표 및 결과 집계
         st.markdown("### 🗳️ 팀플 회의 일정 투표")
         
         col_v1, col_v2 = st.columns([2, 1])
         with col_v1:
             new_candidate = st.text_input("새로운 후보 일정 입력 (예: 6/15(월) 18:00)")
         with col_v2:
-            st.write(" ") # 패딩용
+            st.write(" ")
             st.write(" ")
             if st.button("후보 추가") and new_candidate:
                 if new_candidate not in st.session_state.candidates:
@@ -346,14 +399,12 @@ elif page == "공지·회의록 및 투표":
                 submit_vote = st.form_submit_button("투표하기")
                 
                 if submit_vote and voter and selected_options:
-                    # 중복 투표 방지를 위해 기존 투표 제거 후 재등록
                     st.session_state.votes = [v for v in st.session_state.votes if v["투표자"] != voter]
                     for opt in selected_options:
                         st.session_state.votes.append({"일정": opt, "투표자": voter})
                     st.success("투표가 성공적으로 반영되었습니다!")
                     st.rerun()
             
-            # 결과 집계 시각화
             if st.session_state.votes:
                 st.markdown("#### 📊 투표 결과 (가장 적합한 일정 추출)")
                 vote_df = pd.DataFrame(st.session_state.votes)
