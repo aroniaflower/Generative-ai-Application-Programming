@@ -12,3 +12,6 @@ show_sidebar_logo()
 st.sidebar.title("📌 메뉴")
 
 부분 2개가 글자 오류가 발생해서 제거했습니다.
+
+
+
