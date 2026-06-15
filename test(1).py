@@ -1,3 +1,9 @@
+from ui import setup_ui, show_header, show_sidebar_logo
+
+setup_ui()
+show_header()
+show_sidebar_logo()
+
 import streamlit as st
 import datetime
 import json
