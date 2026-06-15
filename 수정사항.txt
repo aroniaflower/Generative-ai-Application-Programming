@@ -1,0 +1,17 @@
+1. test.py의 시작에 
+from ui import setup_ui, show_header, show_sidebar_logo
+
+setup_ui()
+show_header()
+show_sidebar_logo()
+추가했습니다.
+
+
+2. main braunch에 있는 test.py기준으로 25번째 줄에 있는 
+
+st.sidebar.title("📌 메뉴")
+
+부분에서 같이 작동시키니 글자 오류가 발생해서 제거했습니다.
+
+
+
